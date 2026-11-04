@@ -1227,6 +1227,13 @@ pub trait Function {
     /// Get the index of the entry block.
     fn entry_block(&self) -> Block;
 
+    /// Whether `block` seldom runs. Its uses and moves count as outside any
+    /// loop, and a branch from it to an earlier block closes no loop, so a
+    /// client may place such blocks after the hot code they branch back to.
+    fn is_cold_block(&self, _block: Block) -> bool {
+        false
+    }
+
     /// Provide the range of instruction indices contained in each block.
     fn block_insns(&self, block: Block) -> InstRange;
 
