@@ -118,7 +118,7 @@ impl CFGInfo {
             }
 
             for &succ in f.block_succs(block) {
-                if succ.index() <= block.index() {
+                if succ.index() <= block.index() && !f.is_cold_block(block) {
                     backedge_in[succ.index()] += 1;
                     backedge_out[block.index()] += 1;
                 }
@@ -134,7 +134,11 @@ impl CFGInfo {
                 backedge_stack.push(backedge_in[block]);
             }
 
-            approx_loop_depth.push(cur_depth);
+            approx_loop_depth.push(if f.is_cold_block(Block::new(block)) {
+                0
+            } else {
+                cur_depth
+            });
 
             while backedge_stack.len() > 0 && backedge_out[block] > 0 {
                 backedge_out[block] -= 1;

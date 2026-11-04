@@ -57,6 +57,7 @@ pub struct Func {
     num_vregs: usize,
     reftype_vregs: Vec<VReg>,
     debug_value_labels: Vec<(VReg, Inst, Inst, u32)>,
+    cold_blocks: Vec<bool>,
 }
 
 impl Function for Func {
@@ -71,6 +72,10 @@ impl Function for Func {
     fn entry_block(&self) -> Block {
         debug_assert!(self.blocks.len() > 0);
         Block::new(0)
+    }
+
+    fn is_cold_block(&self, block: Block) -> bool {
+        self.cold_blocks[block.index()]
     }
 
     fn block_insns(&self, block: Block) -> InstRange {
@@ -153,6 +158,7 @@ impl FuncBuilder {
                 num_vregs: 0,
                 reftype_vregs: vec![],
                 debug_value_labels: vec![],
+                cold_blocks: vec![],
             },
             insts_per_block: vec![],
         }
@@ -415,6 +421,10 @@ impl Func {
             builder.add_block();
         }
         let num_blocks = builder.f.blocks.len();
+        // Coldness is only a hint, so any block may claim it.
+        builder.f.cold_blocks = (0..num_blocks)
+            .map(|_| u.ratio(1, 4))
+            .collect::<ArbitraryResult<_>>()?;
 
         // Generate a CFG. Create a "spine" of either single blocks,
         // with links to the next; or fork patterns, with the left

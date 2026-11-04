@@ -16,7 +16,7 @@ use crate::ion::data_structures::{
     BlockparamOut, CodeRange, Env, LiveBundleIndex, LiveRangeList, SpillSet, SpillSlotIndex,
     VRegIndex,
 };
-use crate::{Function, Inst, OperandConstraint, OperandKind, PReg, ProgPoint};
+use crate::{Block, Function, Inst, OperandConstraint, OperandKind, PReg, ProgPoint};
 use alloc::format;
 use core::convert::TryFrom;
 
@@ -423,7 +423,17 @@ impl<'a, F: Function> Env<'a, F> {
         limit
     }
 
+    /// The start of the run of cold blocks that ends the function, if any.
+    fn cold_suffix_start(&self) -> Option<ProgPoint> {
+        let first = (0..self.func.num_blocks())
+            .rev()
+            .take_while(|&block| self.func.is_cold_block(Block::new(block)))
+            .last()?;
+        Some(self.ctx.cfginfo.block_entry[first])
+    }
+
     pub fn queue_bundles(&mut self) {
+        let cold_start = self.cold_suffix_start();
         for bundle in 0..self.bundles.len() {
             trace!("enqueueing bundle{}", bundle);
             let bundle = LiveBundleIndex::new(bundle);
@@ -432,6 +442,18 @@ impl<'a, F: Function> Env<'a, F> {
                 continue;
             }
             self.recompute_bundle_properties(bundle);
+            // Hot code competes only with hot code for registers: a bundle that
+            // reaches the cold blocks parts there, at no cost to its splits.
+            if let Some(cold) = cold_start {
+                let ranges = &self.bundles[bundle].ranges;
+                let (first, last) = (ranges[0].range.from, ranges[ranges.len() - 1].range.to);
+                if first < cold && cold < last {
+                    let spillset = self.bundles[bundle].spillset;
+                    self.split_and_requeue_bundle(bundle, cold, PReg::invalid(), false);
+                    self.ctx.spillsets[spillset].splits -= 1;
+                    continue;
+                }
+            }
             let prio = self.bundles[bundle].prio as usize;
             self.allocation_queue.insert(bundle, prio, PReg::invalid());
         }
