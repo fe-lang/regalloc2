@@ -511,6 +511,8 @@ impl<T> UnsafeSendSync<T> {
 
 pub struct Ctx {
     pub(crate) cfginfo: CFGInfo,
+    /// For each block, the most values live at once in it, by register class.
+    pub(crate) block_pressure: Vec<[u32; 3]>,
     pub(crate) cfginfo_ctx: CFGInfoCtx,
     pub(crate) liveins: Vec<IndexSet>,
     pub(crate) liveouts: Vec<IndexSet>,
@@ -601,6 +603,7 @@ impl Default for Ctx {
             vregs: unsafe { UnsafeSendSync::new(Default::default()) },
 
             cfginfo: Default::default(),
+            block_pressure: Vec::new(),
             cfginfo_ctx: Default::default(),
             liveins: Default::default(),
             liveouts: Default::default(),

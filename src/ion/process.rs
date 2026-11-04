@@ -23,8 +23,8 @@ use crate::{
         MINIMAL_BUNDLE_SPILL_WEIGHT, MINIMAL_FIXED_BUNDLE_SPILL_WEIGHT,
         MINIMAL_LIMITED_BUNDLE_SPILL_WEIGHT,
     },
-    Allocation, Function, Inst, InstPosition, OperandConstraint, OperandKind, PReg, ProgPoint,
-    RegAllocError,
+    Allocation, Block, Function, Inst, InstPosition, OperandConstraint, OperandKind, PReg,
+    ProgPoint, RegAllocError, RegClass,
 };
 use core::fmt::Debug;
 use smallvec::{smallvec, SmallVec};
@@ -409,6 +409,82 @@ impl<'a, F: Function> Env<'a, F> {
         }
     }
 
+    /// Records the most values of each register class live at once in each
+    /// block, before any range is split.
+    pub fn compute_block_pressure(&mut self) {
+        let mut delta = alloc::vec![[0i32; 3]; self.func.num_insts() + 1];
+        for vreg in self.ctx.vregs.iter() {
+            if let Some(class) = vreg.class {
+                for entry in vreg.ranges.iter() {
+                    delta[entry.range.from.inst().index()][class as usize] += 1;
+                    delta[entry.range.to.inst().index()][class as usize] -= 1;
+                }
+            }
+        }
+        let mut live = [0i32; 3];
+        let mut next_inst = 0;
+        let block_pressure = &mut self.ctx.block_pressure;
+        block_pressure.clear();
+        for block in 0..self.func.num_blocks() {
+            let insts = self.func.block_insns(Block::new(block));
+            let mut peak = [0u32; 3];
+            while next_inst < insts.last().next().index() {
+                for class in 0..3 {
+                    live[class] += delta[next_inst][class];
+                    peak[class] = peak[class].max(live[class].max(0) as u32);
+                }
+                next_inst += 1;
+            }
+            block_pressure.push(peak);
+        }
+    }
+
+    /// The blocks of the innermost loop around `pos`, if it has one and its
+    /// values of `class` can all be in registers at once. Past that point,
+    /// holding one value through the loop only forces out another.
+    fn roomy_loop_around(&self, pos: ProgPoint, class: RegClass) -> Option<(usize, usize)> {
+        let cfg = &self.ctx.cfginfo;
+        let block = cfg.insn_block[pos.inst().index()].index();
+        let depth = cfg.approx_loop_depth[block];
+        if depth == 0 {
+            return None;
+        }
+        let in_loop = |b: &usize| cfg.approx_loop_depth[*b] >= depth;
+        let first = (0..=block)
+            .rev()
+            .take_while(in_loop)
+            .last()
+            .unwrap_or(block);
+        let last = (block..cfg.approx_loop_depth.len())
+            .take_while(in_loop)
+            .last()
+            .unwrap_or(block);
+        let regs = self.env.preferred_regs_by_class[class as usize].len()
+            + self.env.non_preferred_regs_by_class[class as usize].len();
+        (first..=last)
+            .all(|b| self.ctx.block_pressure[b][class as usize] <= regs)
+            .then_some((first, last))
+    }
+
+    /// The point just past `pos`'s instruction, or if that lies in a loop with
+    /// room for its values, the end of the loop.
+    fn loop_end_after(&self, pos: ProgPoint, class: RegClass) -> ProgPoint {
+        let inst = match self.roomy_loop_around(pos, class) {
+            Some((_, last)) => self.ctx.cfginfo.block_exit[last].inst(),
+            None => pos.inst(),
+        };
+        ProgPoint::before(inst.next())
+    }
+
+    /// The point before `pos`'s instruction, or if that lies in a loop with room
+    /// for its values, the start of the loop.
+    fn loop_start_before(&self, pos: ProgPoint, class: RegClass) -> ProgPoint {
+        ProgPoint::before(match self.roomy_loop_around(pos, class) {
+            Some((first, _)) => self.ctx.cfginfo.block_entry[first].inst(),
+            None => pos.inst(),
+        })
+    }
+
     pub fn split_and_requeue_bundle(
         &mut self,
         bundle: LiveBundleIndex,
@@ -650,11 +726,24 @@ impl<'a, F: Function> Env<'a, F> {
             // the spill bundle.  (We are careful to treat the "starts at
             // def" flag as an implicit first def even if no def-type Use
             // is present.)
+            // A loop reads the value again through its back edge, so the region
+            // up to the end of the loop of the last use is not empty.
+            let class = self.ctx.spillsets[spillset].class;
+            let keep_until = self.ctx.bundles[bundle]
+                .ranges
+                .iter()
+                .rev()
+                .find_map(|entry| self.ctx.ranges[entry.index].uses.last().map(|u| u.pos))
+                .map(|last_use| self.loop_end_after(last_use, class));
             while let Some(entry) = self.ctx.bundles[bundle].ranges.last().cloned() {
                 let end = entry.range.to;
                 let vreg = self.ctx.ranges[entry.index].vreg;
+                if keep_until.is_some_and(|keep| keep >= end) {
+                    break;
+                }
                 let last_use = self.ctx.ranges[entry.index].uses.last().map(|u| u.pos);
-                if last_use.is_none() {
+                let starts_after_keep = keep_until.is_none_or(|keep| entry.range.from >= keep);
+                if last_use.is_none() && starts_after_keep {
                     let spill = self
                         .get_or_create_spill_bundle(bundle, /* create_if_absent = */ true)
                         .unwrap();
@@ -669,8 +758,7 @@ impl<'a, F: Function> Env<'a, F> {
                     self.ctx.ranges[entry.index].bundle = spill;
                     continue;
                 }
-                let last_use = last_use.unwrap();
-                let split = ProgPoint::before(last_use.inst().next());
+                let split = keep_until.expect("a range below the bound has a last use before it");
                 if split < end {
                     let spill = self
                         .get_or_create_spill_bundle(bundle, /* create_if_absent = */ true)
@@ -707,14 +795,23 @@ impl<'a, F: Function> Env<'a, F> {
                 }
                 break;
             }
+            let keep_from = self.ctx.bundles[new_bundle]
+                .ranges
+                .iter()
+                .find_map(|entry| self.ctx.ranges[entry.index].uses.first().map(|u| u.pos))
+                .map(|first_use| self.loop_start_before(first_use, class));
             while let Some(entry) = self.ctx.bundles[new_bundle].ranges.first().cloned() {
                 if self.ctx.ranges[entry.index].has_flag(LiveRangeFlag::StartsAtDef) {
                     break;
                 }
                 let start = entry.range.from;
+                if keep_from.is_some_and(|keep| keep <= start) {
+                    break;
+                }
                 let vreg = self.ctx.ranges[entry.index].vreg;
                 let first_use = self.ctx.ranges[entry.index].uses.first().map(|u| u.pos);
-                if first_use.is_none() {
+                let ends_before_keep = keep_from.is_none_or(|keep| entry.range.to <= keep);
+                if first_use.is_none() && ends_before_keep {
                     let spill = self
                         .get_or_create_spill_bundle(new_bundle, /* create_if_absent = */ true)
                         .unwrap();
@@ -729,8 +826,7 @@ impl<'a, F: Function> Env<'a, F> {
                     self.ctx.ranges[entry.index].bundle = spill;
                     continue;
                 }
-                let first_use = first_use.unwrap();
-                let split = ProgPoint::before(first_use.inst());
+                let split = keep_from.expect("a range past the bound has a first use after it");
                 if split > start {
                     let spill = self
                         .get_or_create_spill_bundle(new_bundle, /* create_if_absent = */ true)
